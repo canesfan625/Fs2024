@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#020617" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>MSFS 2024 EFB + CDU PRO</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 m-0 p-0">
+  <div id="root"></div>
+  <script type="text/babel">
+
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+// --- 1. GEODESIC, ATMOSPHERIC & AIRAC SOLVERS ---
+const getAiracInfo = () => {
+  const epoch = new Date('2025-01-23T00:00:00Z').getTime();
+  const now = Date.now();
+  const cycleMs = 28 * 86400 * 1000;
+  const elapsed = Math.max(0, Math.floor((now - epoch) / cycleMs));
+  const year = 26;
+  const cycleNum = ((elapsed % 13) + 1).toString().padStart(2, '0');
+  const nextSwitch = new Date(epoch + (elapsed + 1) * cycleMs);
+  const daysLeft = Math.max(1, Math.ceil((nextSwitch.getTime() - now) / 86400000));
+  return { code: `${year}${cycleNum}`, daysLeft, effective: 'AIRAC 2611 ACTIVE' };
+};
+
+const toRad = (d) => (d * Math.PI) / 180;
+const toDeg = (r) => (r * 180) / Math.PI;
+
+const calcGreatCircle = (lat1, lon1, lat2, lon2) => {
+  const R = 3440.065; // NM
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  const distNm = Math.max(1, R * c);
+  const y = Math.sin(dLon) * Math.cos(toRad(lat2));
+  const x =
+    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLon);
+  const brg = (toDeg(Math.atan2(y, x)) + 360) % 360;
+  return { distNm: Math.round(distNm * 10) / 10, trackDeg: Math.round(brg) };
+};
+
+// --- 2. AIRCRAFT FLEET DATABASE (AIRBUS / BOEING / GARMIN) ---
+const FLEET_DB = {
+  A320: {
+    id: 'A320', name: 'Airbus A320neo (Inibuilds/FBW)', family: 'AIRBUS',
+    oewKg: 44300, maxZfwKg: 62500, mtowKg: 79000, mlwKg: 67400, maxFuelKg: 19000,
+    cruiseTas: 455, cruiseMach: '0.78', burnKgHr: 2500, taxiBurnKgMin: 12,
+    optFl: 360, maxFl: 390, flapConfig: '1+F', thsDefault: 'UP0.8',
+    v1Base: 136, vrBase: 139, v2Base: 142, vrefBase: 131
+  },
+  A332: {
+    id: 'A332', name: 'Airbus A330-200 / -300', family: 'AIRBUS',
+    oewKg: 120500, maxZfwKg: 170000, mtowKg: 233000, mlwKg: 182000, maxFuelKg: 109185,
+    cruiseTas: 475, cruiseMach: '0.82', burnKgHr: 5600, taxiBurnKgMin: 24,
+    optFl: 370, maxFl: 410, flapConfig: '1+F', thsDefault: 'UP1.9',
+    v1Base: 142, vrBase: 147, v2Base: 152, vrefBase: 136
+  },
+  B748: {
+    id: 'B748', name: 'Boeing 747-8 Intercontinental', family: 'BOEING',
+    oewKg: 220128, maxZfwKg: 295289, mtowKg: 447696, mlwKg: 312072, maxFuelKg: 193347,
+    cruiseTas: 495, cruiseMach: '0.85', burnKgHr: 10200, taxiBurnKgMin: 42,
+    optFl: 350, maxFl: 430, flapConfig: '10', thsDefault: '4.8 UN',
+    v1Base: 149, vrBase: 158, v2Base: 165, vrefBase: 146
+  },
+  B738: {
+    id: 'B738', name: 'Boeing 737 MAX 8 / 800', family: 'BOEING',
+    oewKg: 45070, maxZfwKg: 65952, mtowKg: 82191, mlwKg: 69308, maxFuelKg: 20730,
+    cruiseTas: 453, cruiseMach: '0.79', burnKgHr: 2450, taxiBurnKgMin: 11,
+    optFl: 360, maxFl: 410, flapConfig: '5', thsDefault: '5.2 UN',
+    v1Base: 138, vrBase: 141, v2Base: 146, vrefBase: 135
+  },
+  A400M: {
+    id: 'A400M', name: 'Airbus A400M Atlas', family: 'AIRBUS',
+    oewKg: 78600, maxZfwKg: 109600, mtowKg: 141000, mlwKg: 123000, maxFuelKg: 50500,
+    cruiseTas: 420, cruiseMach: '0.72', burnKgHr: 4100, taxiBurnKgMin: 18,
+    optFl: 310, maxFl: 370, flapConfig: '1', thsDefault: 'UP0.5',
+    v1Base: 118, vrBase: 124, v2Base: 131, vrefBase: 119
+  },
+  CJ4: {
+    id: 'CJ4', name: 'Cessna Citation CJ4 (WT21)', family: 'GARMIN',
+    oewKg: 4660, maxZfwKg: 5670, mtowKg: 7761, mlwKg: 7103, maxFuelKg: 2644,
+    cruiseTas: 435, cruiseMach: '0.74', burnKgHr: 640, taxiBurnKgMin: 4,
+    optFl: 410, maxFl: 450, flapConfig: '15°', thsDefault: 'N/A',
+    v1Base: 103, vrBase: 108, v2Base: 117, vrefBase: 106
+  },
+  SF50: {
+    id: 'SF50', name: 'Cirrus Vision Jet G2 (G3000)', family: 'GARMIN',
+    oewKg: 1620, maxZfwKg: 2222, mtowKg: 2722, mlwKg: 2517, maxFuelKg: 907,
+    cruiseTas: 305, cruiseMach: '0.53', burnKgHr: 215, taxiBurnKgMin: 2,
+    optFl: 280, maxFl: 310, flapConfig: '50%', thsDefault: 'N/A',
+    v1Base: 82, vrBase: 85, v2Base: 91, vrefBase: 85
+  }
+};
+
+// --- 3. AIRAC 2611 AIRPORT & PROCEDURE DATABASE ---
+const AIRPORTS_DB = {
+  KRDU: {
+    icao: 'KRDU', name: 'Raleigh-Durham Intl', lat: 35.8776, lon: -78.7875, elevFt: 435, magVar: -9,
+    sids: ['SHPRD4', 'BEXGO5', 'HURIC4', 'OXFRD5', 'LWOOD5', 'ROZBO5'],
+    stars: ['TAQLE3', 'ALDAN4', 'BLOGS3', 'DMSTR2'],
+    rwys: [
+      { id: '23L', hdg: 232, lenFt: 10000, ils: '111.70', crs: 232, daFt: 612 },
+      { id: '23R', hdg: 232, lenFt: 7500, ils: '109.90', crs: 232, daFt: 628 },
+      { id: '05R', hdg: 52, lenFt: 10000, ils: '110.55', crs: 52, daFt: 615 },
+      { id: '05L', hdg: 52, lenFt: 7500, ils: '108.50', crs: 52, daFt: 635 }
+    ]
+  },
+  KCLT: {
+    icao: 'KCLT', name: 'Charlotte Douglas Intl', lat: 35.2140, lon: -80.9431, elevFt: 748, magVar: -8,
+    sids: ['JOJJO8', 'KWEEN8', 'KRITR9', 'ICONS8', 'WEAZL8'],
+    stars: ['CHSLY9', 'FILPZ7', 'PARQR7', 'STOCR5', 'JONZE8', 'BANKR8'],
+    rwys: [
+      { id: '18C', hdg: 183, lenFt: 10000, ils: '111.30', crs: 183, daFt: 948 },
+      { id: '18L', hdg: 183, lenFt: 8676, ils: '110.35', crs: 183, daFt: 942 },
+      { id: '18R', hdg: 183, lenFt: 9000, ils: '110.95', crs: 183, daFt: 945 },
+      { id: '36C', hdg: 3, lenFt: 10000, ils: '111.30', crs: 3, daFt: 948 },
+      { id: '36R', hdg: 3, lenFt: 8676, ils: '109.50', crs: 3, daFt: 942 }
+    ]
+  },
+  KATL: {
+    icao: 'KATL', name: 'Hartsfield-Jackson Atlanta', lat: 33.6407, lon: -84.4277, elevFt: 1026, magVar: -6,
+    sids: ['PLMMR3', 'RNDRZ3', 'VRSTY2', 'GAIRY2', 'CUTTN2'],
+    stars: ['JJEDI4', 'OZZZI2', 'SITTH3', 'HOBTT2', 'GNDLF2'],
+    rwys: [
+      { id: '27R', hdg: 274, lenFt: 9000, ils: '108.90', crs: 274, daFt: 1226 },
+      { id: '26L', hdg: 274, lenFt: 9000, ils: '109.90', crs: 274, daFt: 1218 },
+      { id: '09L', hdg: 94, lenFt: 12390, ils: '110.50', crs: 94, daFt: 1226 },
+      { id: '08R', hdg: 94, lenFt: 9000, ils: '109.30', crs: 94, daFt: 1220 }
+    ]
+  },
+  KJFK: {
+    icao: 'KJFK', name: 'John F. Kennedy Intl', lat: 40.6413, lon: -73.7781, elevFt: 13, magVar: -13,
+    sids: ['SKORR6', 'DEEZZ6', 'JFK5', 'BETTE3'],
+    stars: ['CAMRN5', 'LENDY8', 'ROBER3', 'PARCH4'],
+    rwys: [
+      { id: '22L', hdg: 224, lenFt: 8400, ils: '110.90', crs: 224, daFt: 213 },
+      { id: '31L', hdg: 314, lenFt: 14511, ils: '111.35', crs: 314, daFt: 213 },
+      { id: '04R', hdg: 44, lenFt: 8400, ils: '109.50', crs: 44, daFt: 213 }
+    ]
+  },
+  KIAD: {
+    icao: 'KIAD', name: 'Washington Dulles Intl', lat: 38.9531, lon: -77.4565, elevFt: 312, magVar: -11,
+    sids: ['CAVLR7', 'JDUBB3', 'RNLDI5'],
+    stars: ['GIBBZ6', 'FRDMM6', 'COATT5', 'HYPER9'],
+    rwys: [
+      { id: '19C', hdg: 192, lenFt: 11500, ils: '111.30', crs: 192, daFt: 512 },
+      { id: '01R', hdg: 12, lenFt: 11500, ils: '110.10', crs: 12, daFt: 512 }
+    ]
+  },
+  KMCO: {
+    icao: 'KMCO', name: 'Orlando Intl', lat: 28.4312, lon: -81.3081, elevFt: 96, magVar: -7,
+    sids: ['SNFLD3', 'FATHE3', 'JAGAL2'],
+    stars: ['PRICY5', 'CWRLD5', 'GRNCH5', 'TONNY3'],
+    rwys: [
+      { id: '18L', hdg: 184, lenFt: 12005, ils: '111.90', crs: 184, daFt: 296 },
+      { id: '36R', hdg: 4, lenFt: 12005, ils: '110.70', crs: 4, daFt: 296 }
+    ]
+  },
+  KGSO: {
+    icao: 'KGSO', name: 'Piedmont Triad Intl', lat: 36.0978, lon: -79.9373, elevFt: 926, magVar: -8,
+    sids: ['TRIAD2', 'KOURT3'],
+    stars: ['HENBY3', 'BROOK2'],
+    rwys: [
+      { id: '23R', hdg: 233, lenFt: 10000, ils: '109.90', crs: 233, daFt: 1126 },
+      { id: '05L', hdg: 53, lenFt: 10000, ils: '111.90', crs: 53, daFt: 1126 }
+    ]
+  },
+  KILM: {
+    icao: 'KILM', name: 'Wilmington Intl', lat: 34.2706, lon: -77.9026, elevFt: 31, magVar: -9,
+    sids: ['ILM5'],
+    stars: ['DIRECT'],
+    rwys: [
+      { id: '24', hdg: 242, lenFt: 8016, ils: '110.30', crs: 242, daFt: 231 },
+      { id: '06', hdg: 62, lenFt: 8016, ils: '110.30', crs: 62, daFt: 231 }
+    ]
+  }
+};
+
+const REGIONAL_ROUTES = {
+  'KRDU-KCLT': { sid: 'SHPRD4', star: 'CHSLY9', fixes: [{ id: 'CATAR', frac: 0.16 }, { id: 'SHPRD', frac: 0.38 }, { id: 'NASCR', frac: 0.62 }, { id: 'CHSLY', frac: 0.84 }] },
+  'KCLT-KRDU': { sid: 'KWEEN8', star: 'ALDAN4', fixes: [{ id: 'KWEEN', frac: 0.25 }, { id: 'LIB', frac: 0.55 }, { id: 'ALDAN', frac: 0.82 }] },
+  'KRDU-KATL': { sid: 'SHPRD4', star: 'JJEDI4', fixes: [{ id: 'SHPRD', frac: 0.18 }, { id: 'SPA', frac: 0.52 }, { id: 'GRD', frac: 0.72 }, { id: 'JJEDI', frac: 0.88 }] },
+  'KRDU-KJFK': { sid: 'OXFRD5', star: 'CAMRN5', fixes: [{ id: 'OXFRD', frac: 0.18 }, { id: 'HPW', frac: 0.44 }, { id: 'SBY', frac: 0.68 }, { id: 'CAMRN', frac: 0.88 }] },
+  'KRDU-KIAD': { sid: 'LWOOD5', star: 'COATT5', fixes: [{ id: 'LWOOD', frac: 0.24 }, { id: 'FAK', frac: 0.54 }, { id: 'COATT', frac: 0.84 }] },
+  'KILM-KRDU': { sid: 'ILM5', star: 'TAQLE3', fixes: [{ id: 'SOP', frac: 0.35 }, { id: 'BECTI', frac: 0.65 }, { id: 'TAQLE', frac: 0.85 }] }
+};
+
+function CduRow({ lskL, titleL, valL, subL, lskR, titleR, valR, subR, onTap }) {
+  return (
+    <div className="grid grid-cols-2 gap-2 py-2 px-2.5 border-b border-slate-800/90 bg-slate-950/80">
+      <button
+        type="button"
+        onClick={() => onTap && onTap(`${titleL}: ${valL}`)}
+        className="text-left min-w-0 p-1.5 rounded bg-slate-900/70 hover:bg-slate-800/80 border border-slate-800 transition"
+      >
+        <div className="flex items-center justify-between text-[10px] text-slate-400 font-mono">
+          <span>{lskL} {titleL}</span>
+        </div>
+        <div className="text-sm font-bold text-emerald-400 font-mono break-words mt-0.5">{valL}</div>
+        {subL && <div className="text-[10px] text-sky-400 font-mono break-words">{subL}</div>}
+      </button>
+      <button
+        type="button"
+        onClick={() => onTap && onTap(`${titleR}: ${valR}`)}
+        className="text-right min-w-0 p-1.5 rounded bg-slate-900/70 hover:bg-slate-800/80 border border-slate-800 transition"
+      >
+        <div className="flex items-center justify-end text-[10px] text-slate-400 font-mono">
+          <span>{titleR} {lskR}</span>
+        </div>
+        <div className="text-sm font-bold text-cyan-300 font-mono break-words mt-0.5">{valR}</div>
+        {subR && <div className="text-[10px] text-amber-400 font-mono break-words">{subR}</div>}
+      </button>
+    </div>
+  );
+}
+
+function App() {
+  const airac = useMemo(() => getAiracInfo(), []);
+  const [activeTab, setActiveTab] = useState('INIT');
+  const [acftId, setAcftId] = useState('A320');
+  const [depIcao, setDepIcao] = useState('KRDU');
+  const [arrIcao, setArrIcao] = useState('KCLT');
+  const [selectedSid, setSelectedSid] = useState('SHPRD4');
+  const [selectedStar, setSelectedStar] = useState('CHSLY9');
+  const [depRwyId, setDepRwyId] = useState('23L');
+  const [arrRwyId, setArrRwyId] = useState('18C');
+  const [paxLoadPct, setPaxLoadPct] = useState(78);
+  const [taxiMin, setTaxiMin] = useState(15);
+  const [extraMin, setExtraMin] = useState(15);
+  const [useLbs, setUseLbs] = useState(false);
+  const [scratchpad, setScratchpad] = useState('READY - TAP ANY CDU CELL TO COPY');
+
+  // Live Weather State
+  const [wxStatus, setWxStatus] = useState('SYNCING');
+  const [depWx, setDepWx] = useState({ tempC: 18, windDir: 220, windKt: 9, qnhHpa: 1016, qnhInHg: '30.00' });
+  const [arrWx, setArrWx] = useState({ tempC: 20, windDir: 190, windKt: 11, qnhHpa: 1015, qnhInHg: '29.97', wet: false });
+
+  // 4D Virtual INS Tracker State
+  const [trackerRunning, setTrackerRunning] = useState(false);
+  const [flownNm, setFlownNm] = useState(0);
+  const [gsTrimKt, setGsTrimKt] = useState(0);
+  const [simRate, setSimRate] = useState(1);
+  const [syncMode, setSyncMode] = useState('INS_4D');
+  const [ocrString, setOcrString] = useState('GS 455 NASCR 14.2NM');
+
+  const acft = FLEET_DB[acftId] || FLEET_DB.A320;
+  const depApt = AIRPORTS_DB[depIcao] || AIRPORTS_DB.KRDU;
+  const arrApt = AIRPORTS_DB[arrIcao] || AIRPORTS_DB.KCLT;
+
+  // Sync default SID/STAR/RWY when airports change
+  useEffect(() => {
+    const key = `${depIcao}-${arrIcao}`;
+    const reg = REGIONAL_ROUTES[key];
+    setSelectedSid(reg ? reg.sid : depApt.sids[0]);
+    setSelectedStar(reg ? reg.star : arrApt.stars[0]);
+    setDepRwyId(depApt.rwys[0].id);
+    setArrRwyId(arrApt.rwys[0].id);
+    setFlownNm(0);
+    setTrackerRunning(false);
+  }, [depIcao, arrIcao]);
+
+  // Live Open-Meteo Aviation Weather Fetch
+  const fetchWeather = useCallback(async () => {
+    setWxStatus('FETCHING...');
+    try {
+      const fetchOne = async (apt) => {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${apt.lat}&longitude=${apt.lon}&current=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,precipitation&wind_speed_unit=kn`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const c = data.current || {};
+        const hpa = Math.round(c.surface_pressure || 1015);
+        const inHg = (hpa * 0.02953).toFixed(2);
+        return {
+          tempC: Math.round(c.temperature_2m ?? 18),
+          windDir: Math.round(c.wind_direction_10m ?? 210),
+          windKt: Math.round(c.wind_speed_10m ?? 8),
+          qnhHpa: hpa,
+          qnhInHg: inHg,
+          wet: (c.precipitation || 0) > 0
+        };
+      };
+      const [dW, aW] = await Promise.all([fetchOne(depApt), fetchOne(arrApt)]);
+      setDepWx(dW);
+      setArrWx(aW);
+      setWxStatus('LIVE METEO OK');
+    } catch (e) {
+      setWxStatus('ISA FALLBACK');
+    }
+  }, [depApt, arrApt]);
+
+  useEffect(() => {
+    fetchWeather();
+  }, [fetchWeather]);
+
+  // Route & Fuel Calculations
+  const routeMetrics = useMemo(() => {
+    const gc = calcGreatCircle(depApt.lat, depApt.lon, arrApt.lat, arrApt.lon);
+    const totalNm = Math.round(gc.distNm * 1.12 + 18); // Add SID/STAR routing factor
+    const crzFl = totalNm < 180 ? 220 : totalNm < 350 ? 300 : acft.optFl;
+    const gsKt = Math.max(180, acft.cruiseTas + gsTrimKt);
+    const flightHr = totalNm / gsKt;
+    const flightMin = Math.round(flightHr * 60);
+
+    // 6-Part ICAO Fuel Dispatch
+    const taxiKg = Math.round(taxiMin * acft.taxiBurnKgMin);
+    const tripKg = Math.round(flightHr * acft.burnKgHr * 1.06);
+    const contKg = Math.max(200, Math.round(tripKg * 0.05));
+    const altnKg = Math.round((85 / gsKt) * acft.burnKgHr);
+    const finResKg = Math.round(0.5 * acft.burnKgHr);
+    const extraKg = Math.round((extraMin / 60) * acft.burnKgHr);
+    const blockFuelKg = Math.min(acft.maxFuelKg, taxiKg + tripKg + contKg + altnKg + finResKg + extraKg);
+
+    const payloadKg = Math.round((acft.maxZfwKg - acft.oewKg) * (paxLoadPct / 100));
+    const zfwKg = acft.oewKg + payloadKg;
+    const towKg = zfwKg + blockFuelKg - taxiKg;
+    const elwKg = Math.max(zfwKg, towKg - tripKg);
+    const fuelGal = Math.round(blockFuelKg / 3.03);
+    const tankPct = Math.min(100, Math.round((blockFuelKg / acft.maxFuelKg) * 100));
+
+    // Build Legs
+    const key = `${depIcao}-${arrIcao}`;
+    const reg = REGIONAL_ROUTES[key];
+    const baseFixes = reg
+      ? reg.fixes
+      : [
+          { id: selectedSid.slice(0, 5), frac: 0.2 },
+          { id: 'TOC', frac: 0.38 },
+          { id: 'CRZFX', frac: 0.62 },
+          { id: selectedStar.slice(0, 5), frac: 0.85 }
+        ];
+
+    const legs = [
+      { id: `${depIcao}/${depRwyId}`, via: 'ORIG', cumNm: 0, alt: `${depApt.elevFt}FT`, efobKg: blockFuelKg - taxiKg },
+      ...baseFixes.map((f, i) => {
+        const cNm = Math.round(totalNm * f.frac);
+        const burned = Math.round((cNm / totalNm) * tripKg);
+        return {
+          id: f.id,
+          via: i === 0 ? selectedSid : i === baseFixes.length - 1 ? selectedStar : 'DCT',
+          cumNm: cNm,
+          alt: `FL${crzFl}`,
+          efobKg: Math.max(0, blockFuelKg - taxiKg - burned)
+        };
+      }),
+      { id: `${arrIcao}/${arrRwyId}`, via: `ILS${arrRwyId}`, cumNm: totalNm, alt: `${arrApt.elevFt}FT`, efobKg: Math.max(0, blockFuelKg - taxiKg - tripKg) }
+    ];
+
+    const todNm = Math.max(15, Math.round((crzFl * 100 - arrApt.elevFt) / 1000) * 3 + 8);
+    const todAtCumNm = Math.max(10, totalNm - todNm);
+
+    return {
+      totalNm, trackDeg: gc.trackDeg, crzFl, gsKt, flightMin,
+      taxiKg, tripKg, contKg, altnKg, finResKg, extraKg, blockFuelKg,
+      zfwKg, towKg, elwKg, fuelGal, tankPct, legs, todNm, todAtCumNm
+    };
+  }, [depApt, arrApt, depIcao, arrIcao, selectedSid, selectedStar, depRwyId, arrRwyId, acft, paxLoadPct, taxiMin, extraMin, gsTrimKt]);
+
+  // 4D Physics Timer
+  useEffect(() => {
+    if (!trackerRunning) return;
+    const iv = setInterval(() => {
+      setFlownNm((prev) => {
+        const step = (routeMetrics.gsKt / 3600) * simRate;
+        const next = prev + step;
+        if (next >= routeMetrics.totalNm) {
+          setTrackerRunning(false);
+          return routeMetrics.totalNm;
+        }
+        return next;
+      });
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [trackerRunning, routeMetrics.gsKt, routeMetrics.totalNm, simRate]);
+
+  const fmtWt = (kg) => {
+    const val = useLbs ? kg * 2.20462 : kg;
+    return `${(val / 1000).toFixed(1)}${useLbs ? 'KLB' : 'T'}`;
+  };
+
+  const applyOcrSync = () => {
+    const upper = ocrString.toUpperCase();
+    const gsMatch = upper.match(/GS\s*(\d{3})/);
+    if (gsMatch) {
+      const parsedGs = parseInt(gsMatch[1], 10);
+      setGsTrimKt(parsedGs - acft.cruiseTas);
+    }
+    const legMatch = routeMetrics.legs.find((l) => upper.includes(l.id.split('/')[0]));
+    const nmMatch = upper.match(/(\d+(?:\.\d+)?)\s*NM/);
+    if (legMatch) {
+      const remToFix = nmMatch ? parseFloat(nmMatch[1]) : 0;
+      const targetPos = Math.max(0, Math.min(routeMetrics.totalNm, legMatch.cumNm - remToFix));
+      setFlownNm(targetPos);
+      setTrackerRunning(true);
+      setScratchpad(`SYNCED TO ${legMatch.id} (${targetPos.toFixed(1)} NM FLOWN)`);
+    }
+  };
+
+  const depRwyObj = depApt.rwys.find((r) => r.id === depRwyId) || depApt.rwys[0];
+  const arrRwyObj = arrApt.rwys.find((r) => r.id === arrRwyId) || arrApt.rwys[0];
+  const weightFactor = (routeMetrics.towKg - acft.oewKg) / Math.max(1, acft.mtowKg - acft.oewKg);
+  const v1 = Math.round(acft.v1Base + weightFactor * 14);
+  const vr = Math.round(acft.vrBase + weightFactor * 15);
+  const v2 = Math.round(acft.v2Base + weightFactor * 15);
+  const vref = Math.round(acft.vrefBase + weightFactor * 10);
+  const vapp = vref + Math.max(5, Math.round(arrWx.windKt / 3));
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col max-w-md mx-auto border-x border-slate-800 select-none">
+      {/* Top Status & AIRAC Strip */}
+      <header className="bg-slate-900 border-b border-slate-800 px-3 py-2 flex items-center justify-between">
+        <div>
+          <div className="text-xs font-extrabold tracking-wider text-emerald-400 font-mono">
+            MSFS 2024 EFB + CDU PRO
+          </div>
+          <div className="text-[10px] text-slate-400 font-mono">
+            {airac.effective} ({airac.daysLeft}D REM) • {acft.family} MODE
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setUseLbs(!useLbs)}
+            className="px-2 py-1 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono text-cyan-300"
+          >
+            {useLbs ? 'UNITS: LBS' : 'UNITS: KG'}
+          </button>
+          <button
+            type="button"
+            onClick={fetchWeather}
+            className="px-2 py-1 rounded bg-emerald-950/80 border border-emerald-700/70 text-[10px] font-mono text-emerald-300"
+          >
+            {wxStatus}
+          </button>
+        </div>
+      </header>
+
+      {/* Dispatch Bar */}
+      <section className="p-2.5 bg-slate-900/60 border-b border-slate-800 space-y-2">
+        <div className="grid grid-cols-12 gap-1.5 items-center">
+          <div className="col-span-5">
+            <label className="text-[9px] text-slate-400 font-mono block">AIRCRAFT</label>
+            <select
+              value={acftId}
+              onChange={(e) => setAcftId(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs font-mono text-emerald-300"
+            >
+              {Object.values(FLEET_DB).map((a) => (
+                <option key={a.id} value={a.id}>{a.id} - {a.family}</option>
+              ))}
+            </select>
+          </div>
+          <div className="col-span-3">
+            <label className="text-[9px] text-slate-400 font-mono block">ORIGIN</label>
+            <select
+              value={depIcao}
+              onChange={(e) => setDepIcao(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs font-mono text-cyan-300"
+            >
+              {Object.keys(AIRPORTS_DB).map((k) => <option key={k} value={k}>{k}</option>)}
+            </select>
+          </div>
+          <div className="col-span-1 pt-3 flex justify-center">
+            <button
+              type="button"
+              onClick={() => { const tmp = depIcao; setDepIcao(arrIcao); setArrIcao(tmp); }}
+              className="text-xs text-amber-400 font-bold"
+              title="Swap Route"
+            >
+              ⇄
+            </button>
+          </div>
+          <div className="col-span-3">
+            <label className="text-[9px] text-slate-400 font-mono block">DEST</label>
+            <select
+              value={arrIcao}
+              onChange={(e) => setArrIcao(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs font-mono text-cyan-300"
+            >
+              {Object.keys(AIRPORTS_DB).map((k) => <option key={k} value={k}>{k}</option>)}
+            </select>
+          </div>
+        </div>
+
+        {/* Procedure Selectors */}
+        <div className="grid grid-cols-4 gap-1.5">
+          <div>
+            <label className="text-[9px] text-slate-400 font-mono block">DEP RWY</label>
+            <select
+              value={depRwyId}
+              onChange={(e) => setDepRwyId(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded px-1 py-1 text-[11px] font-mono text-slate-200"
+            >
+              {depApt.rwys.map((r) => <option key={r.id} value={r.id}>{r.id}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[9px] text-slate-400 font-mono block">AIRAC SID</label>
+            <select
+              value={selectedSid}
+              onChange={(e) => setSelectedSid(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded px-1 py-1 text-[11px] font-mono text-emerald-400"
+            >
+              {depApt.sids.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[9px] text-slate-400 font-mono block">AIRAC STAR</label>
+            <select
+              value={selectedStar}
+              onChange={(e) => setSelectedStar(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded px-1 py-1 text-[11px] font-mono text-fuchsia-400"
+            >
+              {arrApt.stars.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[9px] text-slate-400 font-mono block">ARR ILS</label>
+            <select
+              value={arrRwyId}
+              onChange={(e) => setArrRwyId(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-800 rounded px-1 py-1 text-[11px] font-mono text-cyan-300"
+            >
+              {arrApt.rwys.map((r) => <option key={r.id} value={r.id}>ILS {r.id}</option>)}
+            </select>
+          </div>
+        </div>
+      </section>
+
+      {/* Hardware Function Key Navigation */}
+      <nav className="grid grid-cols-5 bg-slate-900 border-b border-slate-800 text-[10px] font-mono font-bold">
+        {[
+          { id: 'INIT', label: 'INIT/FUEL' },
+          { id: 'LEGS', label: 'F-PLN/LEGS' },
+          { id: 'APPR', label: 'ARR/APPR' },
+          { id: 'MAP', label: 'ND/TRACK' },
+          { id: 'BRIEF', label: 'BRIEF' }
+        ].map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setActiveTab(t.id)}
+            className={`py-2.5 border-r border-slate-800 transition ${
+              activeTab === t.id
+                ? 'bg-emerald-950/90 text-emerald-300 border-b-2 border-b-emerald-400'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {/* Main Content Area */}
+      <main className="flex-1 overflow-y-auto p-2.5 space-y-3">
+        {activeTab === 'INIT' && (
+          <div className="space-y-3">
+            <div className="border border-slate-800 rounded-lg overflow-hidden">
+              <div className="bg-slate-900 px-3 py-1.5 text-[11px] font-mono font-bold text-slate-300 flex justify-between">
+                <span>{acft.family} CDU — INIT & WEIGHTS</span>
+                <span className="text-emerald-400">{depIcao} ➔ {arrIcao} ({routeMetrics.totalNm} NM)</span>
+              </div>
+              <CduRow
+                lskL="1L" titleL="CO ROUTE / FLT" valL={`${depIcao}${arrIcao}01`} subL={`TRK ${routeMetrics.trackDeg}°M`}
+                lskR="1R" titleR="FROM / TO" valR={`${depIcao}/${arrIcao}`} subR={`ETE ${routeMetrics.flightMin} MIN`}
+                onTap={setScratchpad}
+              />
+              <CduRow
+                lskL="2L" titleL="CRZ FL / TEMP" valL={`FL${routeMetrics.crzFl} / -48°C`} subL={`OPT FL${acft.optFl}`}
+                lskR="2R" titleR="COST INDEX / MACH" valR={`CI 35 / M${acft.cruiseMach}`} subR={`TAS ${acft.cruiseTas}KT`}
+                onTap={setScratchpad}
+              />
+              <CduRow
+                lskL="3L" titleL="ZFW / ZFWCG" valL={`${fmtWt(routeMetrics.zfwKg)} / 28.4%`} subL={`MAX ${fmtWt(acft.maxZfwKg)}`}
+                lskR="3R" titleR="BLOCK FUEL" valR={fmtWt(routeMetrics.blockFuelKg)} subR={`${routeMetrics.fuelGal} GAL (${routeMetrics.tankPct}%)`}
+                onTap={setScratchpad}
+              />
+              <CduRow
+                lskL="4L" titleL="TOW / MTOW" valL={`${fmtWt(routeMetrics.towKg)}`} subL={`LIM ${fmtWt(acft.mtowKg)}`}
+                lskR="4R" titleR="EST LND WT" valR={`${fmtWt(routeMetrics.elwKg)}`} subR={`MLW ${fmtWt(acft.mlwKg)}`}
+                onTap={setScratchpad}
+              />
+              <CduRow
+                lskL="5L" titleL="V1 / VR / V2" valL={`${v1} / ${vr} / ${v2}`} subL={`RWY ${depRwyId} (${depRwyObj.lenFt}FT)`}
+                lskR="5R" titleR="FLAPS / THS" valR={`${acft.flapConfig} / ${acft.thsDefault}`} subR={`FLEX +54°C`}
+                onTap={setScratchpad}
+              />
+            </div>
+
+            {/* 6-Part ICAO Fuel Dispatch Card */}
+            <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-2.5 space-y-2">
+              <div className="flex items-center justify-between text-[11px] font-mono font-bold text-amber-300">
+                <span>ICAO 6-PART FUEL & MSFS EFB TANK SYNC</span>
+                <span>{routeMetrics.tankPct}% TOTAL TANK</span>
+              </div>
+              <div className="grid grid-cols-3 gap-1.5 text-center font-mono">
+                <div className="bg-slate-950 p-1.5 rounded border border-slate-800">
+                  <div className="text-[9px] text-slate-400">1. TAXI ({taxiMin}M)</div>
+                  <div className="text-xs font-bold text-slate-200">{fmtWt(routeMetrics.taxiKg)}</div>
+                </div>
+                <div className="bg-slate-950 p-1.5 rounded border border-slate-800">
+                  <div className="text-[9px] text-slate-400">2. TRIP FUEL</div>
+                  <div className="text-xs font-bold text-emerald-400">{fmtWt(routeMetrics.tripKg)}</div>
+                </div>
+                <div className="bg-slate-950 p-1.5 rounded border border-slate-800">
+                  <div className="text-[9px] text-slate-400">3. CONT (5%)</div>
+                  <div className="text-xs font-bold text-slate-200">{fmtWt(routeMetrics.contKg)}</div>
+                </div>
+                <div className="bg-slate-950 p-1.5 rounded border border-slate-800">
+                  <div className="text-[9px] text-slate-400">4. ALTN (KGSO)</div>
+                  <div className="text-xs font-bold text-cyan-300">{fmtWt(routeMetrics.altnKg)}</div>
+                </div>
+                <div className="bg-slate-950 p-1.5 rounded border border-slate-800">
+                  <div className="text-[9px] text-slate-400">5. FINRES (30M)</div>
+                  <div className="text-xs font-bold text-amber-300">{fmtWt(routeMetrics.finResKg)}</div>
+                </div>
+                <div className="bg-slate-950 p-1.5 rounded border border-slate-800">
+                  <div className="text-[9px] text-slate-400">6. EXTRA ({extraMin}M)</div>
+                  <div className="text-xs font-bold text-fuchsia-300">{fmtWt(routeMetrics.extraKg)}</div>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2 pt-1 text-[10px] font-mono">
+                <div className="flex items-center gap-1">
+                  <span className="text-slate-400">PAX LOAD: {paxLoadPct}%</span>
+                  <input
+                    type="range" min="25" max="100" value={paxLoadPct}
+                    onChange={(e) => setPaxLoadPct(Number(e.target.value))}
+                    className="w-20 accent-emerald-400"
+                  />
+                </div>
+                <div className="flex gap-1">
+                  {[0, 15, 30, 45].map((m) => (
+                    <button
+                      key={m} type="button" onClick={() => setExtraMin(m)}
+                      className={`px-1.5 py-0.5 rounded border ${extraMin === m ? 'bg-amber-500/20 border-amber-400 text-amber-300' : 'border-slate-700 text-slate-400'}`}
+                    >
+                      +{m}M
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'LEGS' && (
+          <div className="border border-slate-800 rounded-lg overflow-hidden">
+            <div className="bg-slate-900 px-3 py-1.5 text-[11px] font-mono font-bold text-slate-300 flex justify-between">
+              <span>ACTIVE F-PLN / VIA ➔ TO SEQUENCE</span>
+              <span className="text-cyan-300">T/D AT {routeMetrics.todAtCumNm} NM</span>
+            </div>
+            <div className="divide-y divide-slate-800 font-mono text-xs">
+              {routeMetrics.legs.map((l, idx) => {
+                const passed = flownNm >= l.cumNm && idx < routeMetrics.legs.length - 1;
+                return (
+                  <div key={l.id} className={`p-2.5 flex items-center justify-between ${passed ? 'opacity-50 bg-slate-950' : 'bg-slate-900/40'}`}>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300">{l.via}</span>
+                        <span className="font-bold text-emerald-400">{l.id}</span>
+                      </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">
+                        CUM {l.cumNm} NM • EFOB {fmtWt(l.efobKg)}
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-fuchsia-300 font-bold">{l.alt}</div>
+                      <button
+                        type="button"
+                        onClick={() => { setFlownNm(l.cumNm); setTrackerRunning(true); }}
+                        className="text-[10px] text-amber-300 underline mt-0.5"
+                      >
+                        DIRECT / HACK
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'APPR' && (
+          <div className="border border-slate-800 rounded-lg overflow-hidden">
+            <div className="bg-slate-900 px-3 py-1.5 text-[11px] font-mono font-bold text-slate-300 flex justify-between">
+              <span>ARRIVAL & APPROACH REF ({arrIcao})</span>
+              <span className="text-emerald-400">QNH {arrWx.qnhHpa} / {arrWx.qnhInHg}</span>
+            </div>
+            <CduRow
+              lskL="1L" titleL="DEST QNH" valL={`${arrWx.qnhHpa} HPA / ${arrWx.qnhInHg}`} subL="LIVE METEO"
+              lskR="1R" titleR="ILS FREQ / CRS" valR={`${arrRwyObj.ils} / ${arrRwyObj.crs}°`} subR={`RWY ${arrRwyObj.id}`}
+              onTap={setScratchpad}
+            />
+            <CduRow
+              lskL="2L" titleL="DEST TEMP / OAT" valL={`${arrWx.tempC}°C`} subL={arrWx.wet ? 'WET RWY REPORTED' : 'DRY RWY'}
+              lskR="2R" titleR="BARO DA(H)" valR={`${arrRwyObj.daFt} FT`} subL="200FT AGL"
+              onTap={setScratchpad}
+            />
+            <CduRow
+              lskL="3L" titleL="MAG WIND" valL={`${arrWx.windDir}° / ${arrWx.windKt}KT`} subL="ENTER IN PERF APPR"
+              lskR="3R" titleR="VREF / VAPP" valR={`${vref} / ${vapp} KT`} subL={`CONFIG FULL`}
+              onTap={setScratchpad}
+            />
+            <CduRow
+              lskL="4L" titleL="TOP OF DESCENT" valL={`${routeMetrics.todNm} NM PRIOR`} subL={`AT MILE ${routeMetrics.todAtCumNm}`}
+              lskR="4R" titleR="REQ 3.0° VS" valR={`-${Math.round(routeMetrics.gsKt * 5.2)} FPM`} subL="VNAV PTH"
+              onTap={setScratchpad}
+            />
+          </div>
+        )}
+
+        {activeTab === 'MAP' && (
+          <div className="space-y-2.5">
+            {/* Virtual ND + VSD Display */}
+            <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono">
+              <div className="flex justify-between text-[10px] text-slate-400 mb-2">
+                <span>GS {routeMetrics.gsKt} KT</span>
+                <span className="text-emerald-400 font-bold">
+                  {flownNm.toFixed(1)} / {routeMetrics.totalNm} NM FLOWN
+                </span>
+                <span className="text-amber-300">
+                  T/D IN {Math.max(0, routeMetrics.todAtCumNm - flownNm).toFixed(1)} NM
+                </span>
+              </div>
+              <svg viewBox="0 0 320 110" className="w-full h-28 bg-slate-900/90 rounded border border-slate-800">
+                <line x1="24" y1="55" x2="296" y2="55" stroke="#334155" strokeWidth="2" strokeDasharray="4 4" />
+                <line
+                  x1="24" y1="55"
+                  x2={24 + (flownNm / Math.max(1, routeMetrics.totalNm)) * 272} y2="55"
+                  stroke="#e879f9" strokeWidth="3"
+                />
+                {routeMetrics.legs.map((l) => {
+                  const x = 24 + (l.cumNm / Math.max(1, routeMetrics.totalNm)) * 272;
+                  return (
+                    <g key={l.id}>
+                      <circle cx={x} cy="55" r="3.5" fill="#38bdf8" />
+                      <text x={x} y="76" fontSize="8" fill="#94a3b8" textAnchor="middle">{l.id.split('/')[0]}</text>
+                    </g>
+                  );
+                })}
+                {/* Aircraft Symbol */}
+                <circle
+                  cx={24 + (flownNm / Math.max(1, routeMetrics.totalNm)) * 272}
+                  cy="55" r="6" fill="#4ade80"
+                />
+              </svg>
+              <input
+                type="range" min="0" max={routeMetrics.totalNm} step="0.5" value={flownNm}
+                onChange={(e) => setFlownNm(Number(e.target.value))}
+                className="w-full mt-2 accent-emerald-400"
+              />
+            </div>
+
+            {/* 4-Mode Non-Connected Tracker Controls */}
+            <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-2.5 space-y-2 font-mono">
+              <div className="flex justify-between items-center">
+                <button
+                  type="button"
+                  onClick={() => setTrackerRunning(!trackerRunning)}
+                  className={`px-3 py-1.5 rounded text-xs font-bold ${trackerRunning ? 'bg-amber-600 text-slate-950' : 'bg-emerald-600 text-slate-950'}`}
+                >
+                  {trackerRunning ? 'PAUSE 4D INS' : 'TOGA / START 4D INS'}
+                </button>
+                <div className="flex gap-1">
+                  {[1, 2, 4].map((r) => (
+                    <button
+                      key={r} type="button" onClick={() => setSimRate(r)}
+                      className={`px-2 py-1 rounded text-[10px] border ${simRate === r ? 'border-emerald-400 text-emerald-300' : 'border-slate-700 text-slate-400'}`}
+                    >
+                      {r}X
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="pt-1 border-t border-slate-800">
+                <div className="text-[10px] text-slate-400 mb-1">MID-FLIGHT ND OCR / STRING TRIANGULATOR</div>
+                <div className="flex gap-1.5">
+                  <input
+                    type="text" value={ocrString} onChange={(e) => setOcrString(e.target.value)}
+                    className="flex-1 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-emerald-300"
+                  />
+                  <button
+                    type="button" onClick={applyOcrSync}
+                    className="px-2.5 py-1 rounded bg-cyan-600 text-slate-950 font-bold text-xs"
+                  >
+                    SYNC POS
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'BRIEF' && (
+          <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-3 space-y-2.5 font-mono text-xs">
+            <div className="text-emerald-400 font-bold border-b border-slate-800 pb-1">
+              CAPTAIN OPERATIONAL DISPATCH BRIEF
+            </div>
+            <div>
+              <span className="text-slate-400">ATC CLEARANCE: </span>
+              <span className="text-cyan-300 font-bold">
+                {depIcao}/{depRwyId} {selectedSid} DCT {selectedStar} {arrIcao}/ILS{arrRwyId}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400">DEPARTURE: </span>
+              <span>V1 {v1} / VR {vr} / V2 {v2} KT • FLAPS {acft.flapConfig} • THS {acft.thsDefault}</span>
+            </div>
+            <div>
+              <span className="text-slate-400">CRUISE & FUEL: </span>
+              <span>FL{routeMetrics.crzFl} • BLOCK {fmtWt(routeMetrics.blockFuelKg)} ({routeMetrics.fuelGal} GAL)</span>
+            </div>
+            <div>
+              <span className="text-slate-400">ARRIVAL WX: </span>
+              <span>{arrIcao} WIND {arrWx.windDir}°/{arrWx.windKt}KT • QNH {arrWx.qnhHpa} ({arrWx.qnhInHg}) • VAPP {vapp}KT</span>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Bottom CDU Scratchpad */}
+      <footer className="bg-slate-950 border-t border-slate-800 px-3 py-2 font-mono text-[11px] text-emerald-400 flex justify-between items-center">
+        <span className="truncate">[ {scratchpad} ]</span>
+        <button
+          type="button"
+          onClick={() => setScratchpad('CLR')}
+          className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-slate-300 ml-2"
+        >
+          CLR
+        </button>
+      </footer>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+
+  </script>
+</body>
+</html>
